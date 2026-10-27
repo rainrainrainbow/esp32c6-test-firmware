@@ -1,4 +1,3 @@
-idf_component_manager()
 # Top-level CMake for the test-firmware project.
 cmake_minimum_required(VERSION 3.16)
 
