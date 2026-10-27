@@ -1,0 +1,41 @@
+name: build-test-firmware
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.3.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32c6
+          idf.py build
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c6-test-firmware
+          path: |
+            build/test_firmware.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/merged_binary.bin
+            build/flasher_args.json
+            build/elf/test_firmware.elf
+          if-no-files-found: error
+
+      - name: Upload full build dir
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build/
+          if-no-files-found: ignore
