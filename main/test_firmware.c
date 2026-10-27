@@ -22,8 +22,8 @@
 #include "driver/i2s_std.h"
 #include "nvs_flash.h"
 #include "esp_timer.h"
-#include "sdmmc_host.h"
-#include "sdmmc_sd.h"
+#include "driver/sdmmc_host.h"
+#include "driver/sdmmc_sd.h"
 
 static const char *TAG = "TEST";
 
