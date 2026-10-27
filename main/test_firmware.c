@@ -23,7 +23,7 @@
 #include "nvs_flash.h"
 #include "esp_timer.h"
 #include "driver/sdmmc_host.h"
-#include "driver/sdmmc_sd.h"
+#include "sdmmc_sd.h"
 
 static const char *TAG = "TEST";
 
