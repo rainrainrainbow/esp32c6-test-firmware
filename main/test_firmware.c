@@ -23,7 +23,7 @@
 #include "nvs_flash.h"
 #include "esp_timer.h"
 #include "driver/sdmmc_host.h"
-#include "sdmmc_sd.h"
+#include "sdmmc_cmd.h"
 
 static const char *TAG = "TEST";
 
@@ -137,7 +137,8 @@ static void sd_test(void) {
     esp_err_t r = sdmmc_card_init(&host, &slot, &card);
     if (r != ESP_OK) { printf("  SD init FAILED: %s\n", esp_err_to_name(r)); return; }
     printf("  SD init OK, size=%lluMB, type=%d\n", (unsigned long long)((uint64_t)card->csd.capacity * card->csd.sector_size / (1024 * 1024)), card->type);
-    sdmmc_card_deinit();
+    // sdmmc_card_deinit is not a public header in IDF 5.3.1; reboot clears state.
+    (void)card;
 }
 
 static void i2s_mic_test(void) {
