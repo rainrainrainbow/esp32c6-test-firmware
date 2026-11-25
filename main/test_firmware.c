@@ -304,17 +304,22 @@ static void epd_full_test(void) {
     printf("  RAM written, BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
     // ---- power on + monitor BUSY + scan all GPIOs for the real BUSY line ----
-    // Snapshot every GPIO (except the ones we drive) before power-on
+    // Snapshot GPIOs SAFE to touch (exclude USB 12/13, strapping 2/8/9, I2C 6/7,
+    // SD 20/21/22, I2S 16/17/23, buzzer 18, RTC_INT 19, buttons 3/9, and driven EPD pins).
     const int driven[] = { EPD_DC, EPD_CS, EPD_RST, EPD_MOSI, EPD_SCLK };
-    static int before[24], changed[24];
-    for (int p = 0; p <= 23; p++) {
+    const int reserved[] = { 2,3,6,7,8,9,12,13,16,17,18,19,20,21,22,23 };
+    const int scan[] = { 0,1,4,5,10,11,14,15 };  // only safe candidates
+    static int before[32], changed[32];
+    for (unsigned k = 0; k < sizeof(scan)/sizeof(scan[0]); k++) {
+        int p = scan[k];
         int used = 0;
         for (unsigned i = 0; i < sizeof(driven)/sizeof(driven[0]); i++) if (p == driven[i]) used = 1;
+        for (unsigned i = 0; i < sizeof(reserved)/sizeof(reserved[0]); i++) if (p == reserved[i]) used = 1;
         if (!used) {
             gpio_set_direction(p, GPIO_MODE_INPUT);
             gpio_set_pull_mode(p, GPIO_FLOATING);
-        }
-        before[p] = gpio_get_level(p);
+            before[p] = gpio_get_level(p);
+        } else before[p] = -1;
         changed[p] = 0;
     }
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -323,10 +328,9 @@ static void epd_full_test(void) {
     int lo = 0;
     for (int t = 0; t < 120; t++) {  // 6 seconds, 50ms ticks
         if (gpio_get_level(EPD_BUSY) == 0) lo = 1;
-        for (int p = 0; p <= 23; p++) {
-            int used = 0;
-            for (unsigned i = 0; i < sizeof(driven)/sizeof(driven[0]); i++) if (p == driven[i]) used = 1;
-            if (used) continue;
+        for (unsigned k = 0; k < sizeof(scan)/sizeof(scan[0]); k++) {
+            int p = scan[k];
+            if (before[p] < 0) continue;
             if (gpio_get_level(p) != before[p]) changed[p] = 1;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -334,13 +338,12 @@ static void epd_full_test(void) {
     printf("  BUSY(IO%d) saw_low=%d now=%d\n", EPD_BUSY, lo, gpio_get_level(EPD_BUSY));
     printf("  GPIOs that changed during power-on (candidate BUSY):\n");
     int any = 0;
-    for (int p = 0; p <= 23; p++) {
-        int used = 0;
-        for (unsigned i = 0; i < sizeof(driven)/sizeof(driven[0]); i++) if (p == driven[i]) used = 1;
-        if (used) continue;
+    for (unsigned k = 0; k < sizeof(scan)/sizeof(scan[0]); k++) {
+        int p = scan[k];
+        if (before[p] < 0) continue;
         if (changed[p]) { printf("    IO%d  before=%d now=%d  <<<\n", p, before[p], gpio_get_level(p)); any++; }
     }
-    if (!any) printf("    (none)\n");
+    if (!any) printf("    (none among safe pins)\n");
 
     epd_cmd(0x12); vTaskDelay(pdMS_TO_TICKS(2000));  // refresh
     printf("  after refresh: BUSY=%d\n", gpio_get_level(EPD_BUSY));
