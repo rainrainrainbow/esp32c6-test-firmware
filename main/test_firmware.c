@@ -1,12 +1,12 @@
 // ESP32-C6 board test firmware (GitHub Actions CI / ESP-IDF 5.3.1)
-// Pin map source: Sheet_20261125.xlsx
-//   I2C  SDA=IO6 SCL=IO7 -> AHT20(0x38), DS3231(0x68), MAX17048(0x36),
-//                            MPU-6500(0x68/0x69), MMC5603NJ(0x30)
-//   Buttons BOOT=IO9 DOWN=IO3 KEY1=IO2 (active-low, pull-up)
-//   Buzzer IO18 (LEDC)
-//   EPD: RST=IO0 BUSY=IO1 DCX=IO4 CS=IO5 CS2=IO14
-//   SD (SPI mode, since C6 has no SDMMC host):
-//        SCK=IO21(CLK) MOSI=IO20(CMD) MISO=IO22(D0) CS=IO8(CD/DAT3)
+// Pin map (confirmed by user 2026-11-25):
+//   EPD  DC=IO0 BUSY=IO1 RST=IO15 CS=IO14 SDA(MOSI)=IO4 CLK(SCLK)=IO5
+//        panel: WFT0154CZ17 / GxEPD2_154_T8 = IL0373, 152x152 B/W
+//   Keys IO9 / IO2 / IO3 (active-low)
+//   I2C  SDA=IO6 SCL=IO7 -> AHT20(0x38) DS3231(0x68) MAX17048(0x36)
+//                            MPU6500(0x68/0x69) MMC5603NJ(0x30)
+//   RTC_INT=IO19   Buzzer=IO18
+//   TF   CS=IO8 MOSI=IO20 CLK=IO21 MISO=IO22 (SDSPI; C6 has no SDMMC host)
 //   I2S mic ICS-43434: SCK=IO16 WS=IO17 SD=IO23
 //   USB: D-=IO12 D+=IO13
 #include <stdio.h>
@@ -30,24 +30,27 @@
 
 static const char *TAG = "TEST";
 
-#define I2C_SDA 6
-#define I2C_SCL 7
+/* ---- confirmed pin map ---- */
+#define I2C_SDA  6
+#define I2C_SCL  7
 #define BTN_BOOT 9
 #define BTN_DOWN 3
 #define BTN_GPIO2 2
-#define BUZZ 18
-#define EPD_RST 0
+#define BUZZ     18
+#define RTC_INT  19
+#define EPD_DC   0
 #define EPD_BUSY 1
-#define EPD_IO4 4
-#define EPD_IO5 5
-#define EPD_CS 14
-#define SD_SCK 21   // SD CLK
-#define SD_MOSI 20  // SD CMD
-#define SD_MISO 22  // SD DAT0
-#define SD_CS 8     // SD CD/DAT3 -> CS in SPI mode
-#define MIC_SCK 16
-#define MIC_WS 17
-#define MIC_SD 23
+#define EPD_MOSI 4
+#define EPD_SCLK 5
+#define EPD_CS   14
+#define EPD_RST  15
+#define SD_SCK   21
+#define SD_MOSI  20
+#define SD_MISO  22
+#define SD_CS    8
+#define MIC_SCK  16
+#define MIC_WS   17
+#define MIC_SD   23
 
 static i2c_master_bus_handle_t bus;
 
@@ -93,7 +96,6 @@ static void i2c_scan_and_read(void) {
     }
     printf("  I2C devices found: %d\n", found);
 
-    // AHT20: trigger measurement, read T/RH
     uint8_t v;
     if (reg_read(0x38, 0x00, &v) == ESP_OK) {
         i2c_device_config_t dev = { .dev_addr_length = I2C_ADDR_BIT_7,
@@ -113,14 +115,12 @@ static void i2c_scan_and_read(void) {
         }
     } else printf("  AHT20: absent\n");
 
-    // DS3231 RTC: read seconds/minutes/hours (BCD)
     if (reg_read(0x68, 0x00, &v) == ESP_OK) {
         uint8_t sec, min, hr;
         reg_read(0x68, 0x00, &sec); reg_read(0x68, 0x01, &min); reg_read(0x68, 0x02, &hr);
-        printf("  DS3231: %02X:%02X:%02X (BCD) raw sec=0x%02X\n", hr, min, sec, sec);
+        printf("  DS3231: %02X:%02X:%02X (BCD)\n", hr, min, sec);
     } else printf("  DS3231: absent\n");
 
-    // MAX17048 fuel gauge: version(0x0F), VCELL(0x02/03), SOC(0x04)
     uint8_t ver, soc, vh, vl;
     if (reg_read(0x36, 0x0F, &ver) == ESP_OK) {
         reg_read(0x36, 0x02, &vh); reg_read(0x36, 0x03, &vl); reg_read(0x36, 0x04, &soc);
@@ -128,7 +128,6 @@ static void i2c_scan_and_read(void) {
         printf("  MAX17048: ver=0x%02X V=%.3fV SOC=%d%%\n", ver, (double)cell*1.25/1000.0, soc);
     } else printf("  MAX17048: absent\n");
 
-    // MPU-6500 WHO_AM_I at 0x75 (0x70/0x71)
     bool mpu = false;
     for (uint8_t a = 0x68; a <= 0x69; a++) {
         if (reg_read(a, 0x75, &v) == ESP_OK && (v == 0x70 || v == 0x71)) {
@@ -137,20 +136,19 @@ static void i2c_scan_and_read(void) {
     }
     if (!mpu) printf("  MPU-6500: WHO_AM_I mismatch/absent\n");
 
-    // MMC5603NJ WHO_AM_I at 0x39 -> 0x10
     if (reg_read(0x30, 0x39, &v) == ESP_OK)
         printf("  MMC5603NJ: WHO_AM_I=0x%02X (expect 0x10)\n", v);
     else printf("  MMC5603NJ: absent\n");
 }
 
-/* ---------- buttons ---------- */
+/* ---------- buttons + RTC interrupt line ---------- */
 static void buttons_test(void) {
-    printf("\n--- Buttons (active-low, pull-up) ---\n");
-    const int pins[] = { BTN_BOOT, BTN_DOWN, BTN_GPIO2 };
-    const char *names[] = { "BOOT(IO9)", "DOWN(IO3)", "KEY1(IO2)" };
-    for (int i = 0; i < 3; i++)
-        printf("  %-12s = %s\n", names[i],
-               gpio_get_level(pins[i]) ? "RELEASED(HIGH)" : "PRESSED(LOW)");
+    printf("\n--- Buttons / RTC_INT ---\n");
+    const int pins[] = { BTN_BOOT, BTN_DOWN, BTN_GPIO2, RTC_INT };
+    const char *names[] = { "BOOT(IO9)", "KEY(IO2)", "KEY(IO3)", "RTC_INT(IO19)" };
+    for (int i = 0; i < 4; i++)
+        printf("  %-14s = %s\n", names[i],
+               gpio_get_level(pins[i]) ? "HIGH" : "LOW");
 }
 
 /* ---------- buzzer ---------- */
@@ -176,14 +174,11 @@ static void buzzer_beep(void) {
     printf("  beeped 3x @2kHz\n");
 }
 
-/* ---------- EPD real refresh: WFT0154CZ17 / GxEPD2_154_T8 (IL0373 152x152 B/W) ----------
- * FPC-24P: RST=IO0 BUSY=IO1 DCX=IO4 CS=IO14; SCLK/MOSI shared with SD on SPI2 (IO21/IO20).
- * Panel setting 0xbf = LUT from register (needs 5 LUTs), BUSY LOW = busy.
- * Exact sequence from GxEPD2_154_T8.cpp (ZinggJM), panel GDEW0154T8.
+/* ---------- EPD: WFT0154CZ17 / GxEPD2_154_T8 (IL0373 152x152 B/W) ----------
+ * Confirmed wiring: DC=IO0 BUSY=IO1 RST=IO15 CS=IO14 MOSI=IO4 SCLK=IO5
+ * Panel setting 0xbf = LUT from register; BUSY LOW = busy, HIGH = idle.
+ * Exact init/LUT sequence from GxEPD2_154_T8.cpp (ZinggJM).
  */
-#define EPD_SCLK 21
-#define EPD_MOSI 20
-#define EPD_DC   4
 #define EPD_W    152
 #define EPD_H    152
 #define EPD_BPL  19   // 152/8 = 19 bytes per line
@@ -210,153 +205,65 @@ static const uint8_t lut_bb[42] = {
     0x80,0x14,0x00,0x00,0x00,0x01, 0x50,0x12,0x12,0x00,0x00,0x01,
     0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00};
 
-/* ---- software SPI (bit-bang) so any pin can be a candidate ---- */
-static int g_sclk, g_mosi, g_dcx, g_cs;
-
+/* bit-bang SPI on the confirmed EPD pins (MSB first, mode 0) */
 static inline void bb_byte(uint8_t b) {
     for (int i = 7; i >= 0; i--) {
-        gpio_set_level(g_sclk, 0);
-        gpio_set_level(g_mosi, (b >> i) & 1);
-        gpio_set_level(g_sclk, 1);
+        gpio_set_level(EPD_SCLK, 0);
+        gpio_set_level(EPD_MOSI, (b >> i) & 1);
+        gpio_set_level(EPD_SCLK, 1);
     }
 }
 static void bb_cmd(uint8_t c) {
-    gpio_set_level(g_dcx, 0); gpio_set_level(g_cs, 0);
-    bb_byte(c); gpio_set_level(g_cs, 1);
+    gpio_set_level(EPD_DC, 0); gpio_set_level(EPD_CS, 0);
+    bb_byte(c); gpio_set_level(EPD_CS, 1);
 }
 static void bb_data(const uint8_t *d, size_t n) {
-    gpio_set_level(g_dcx, 1); gpio_set_level(g_cs, 0);
+    gpio_set_level(EPD_DC, 1); gpio_set_level(EPD_CS, 0);
     for (size_t i = 0; i < n; i++) bb_byte(d[i]);
-    gpio_set_level(g_cs, 1);
+    gpio_set_level(EPD_CS, 1);
 }
 static void bb_d1(uint8_t v) { bb_data(&v, 1); }
 
-/* Wait until BUSY returns to idle. IL0373: LOW=busy, HIGH=idle.
- * Returns ms waited; *saw_low set if BUSY was ever asserted LOW. */
+/* IL0373: LOW=busy, HIGH=idle. Returns ms waited; sets saw_low if BUSY was ever LOW. */
 static int epd_wait_busy(int max_ms, bool *saw_low) {
     int t = 0;
+    bool low = false;
     while (gpio_get_level(EPD_BUSY) == 0) {
-        if (saw_low) *saw_low = true;
+        low = true;
         if (t >= max_ms) break;
         vTaskDelay(pdMS_TO_TICKS(10)); t += 10;
     }
+    if (saw_low) *saw_low = low;
     return t;
 }
 
-/* Probe one pin combination: minimal init + power-on, watch BUSY for a toggle.
- * Returns detected BUSY level during power-on +10, or 0 if no toggle seen. */
-static int epd_probe_one(int dc, int cs, int sclk, int mosi) {
-    g_dcx = dc; g_cs = cs; g_sclk = sclk; g_mosi = mosi;
-    const int outs[5] = { dc, cs, sclk, mosi, EPD_RST };
+static void epd_full_test(void) {
+    printf("\n--- E-paper WFT0154CZ17 / IL0373 152x152 ---\n");
+    printf("  DC=IO%d BUSY=IO%d RST=IO%d CS=IO%d MOSI=IO%d SCLK=IO%d\n",
+           EPD_DC, EPD_BUSY, EPD_RST, EPD_CS, EPD_MOSI, EPD_SCLK);
+
+    const int outs[] = { EPD_DC, EPD_CS, EPD_MOSI, EPD_SCLK, EPD_RST };
     for (int i = 0; i < 5; i++) {
         gpio_set_direction(outs[i], GPIO_MODE_OUTPUT);
         gpio_set_level(outs[i], 1);
     }
     gpio_set_direction(EPD_BUSY, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(EPD_BUSY, GPIO_FLOATING);
-    vTaskDelay(pdMS_TO_TICKS(3));
-    // hardware reset (2ms low / 20ms high)
-    gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
-    int idle = gpio_get_level(EPD_BUSY);
-    // minimal init using OTP LUT
-    bb_cmd(0x00); bb_d1(0x1f);
-    bb_cmd(0x01); bb_d1(0x03); bb_d1(0x00); bb_d1(0x2b); bb_d1(0x2b); bb_d1(0x03);
-    bb_cmd(0x61); bb_d1(EPD_W); bb_d1(0x00); bb_d1(EPD_H);
-    bb_cmd(0x04);  // power on -> BUSY toggles if the panel received it
-    int saw = -1;
-    for (int t = 0; t < 160; t += 5) {
-        int v = gpio_get_level(EPD_BUSY);
-        if (v != idle) { saw = v; break; }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    bb_cmd(0x02);  // power off
-    return saw >= 0 ? (saw + 10) : 0;
-}
-/* Scan every GPIO as a possible BUSY line while issuing power-on with a
- * fixed best-guess SPI mapping. Reports which pins ever toggled. */
-static void epd_busy_pin_scan(void) {
-    printf("\n  [BUSY pin scan] issuing power-on, watching all GPIOs:\n");
-    // use a best-guess mapping (DCX=4 CS=14 CLK=21 MOSI=20), bit-bang
-    g_dcx=4; g_cs=14; g_sclk=21; g_mosi=20;
-    const int outs[5]={4,14,21,20,EPD_RST};
-    for (int i=0;i<5;i++){ gpio_set_direction(outs[i],GPIO_MODE_OUTPUT); gpio_set_level(outs[i],1); }
-    // all other GPIOs as floating inputs
-    for (int p=0;p<=23;p++) {
-        int used=0; for(int i=0;i<5;i++) if(p==outs[i]) used=1;
-        if(!used){ gpio_set_direction(p,GPIO_MODE_INPUT); gpio_set_pull_mode(p,GPIO_FLOATING); }
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
-    gpio_set_level(EPD_RST,0); vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(EPD_RST,1); vTaskDelay(pdMS_TO_TICKS(20));
-
-    static int before[24], after[24], toggled[24];
-    for(int p=0;p<=23;p++){ before[p]=gpio_get_level(p); toggled[p]=0; }
-    bb_cmd(0x00); bb_d1(0x1f);
-    bb_cmd(0x01); bb_d1(0x03); bb_d1(0x00); bb_d1(0x2b); bb_d1(0x2b); bb_d1(0x03);
-    bb_cmd(0x61); bb_d1(EPD_W); bb_d1(0x00); bb_d1(EPD_H);
-    bb_cmd(0x04);
-    for(int t=0;t<200;t++){
-        for(int p=0;p<=23;p++){
-            int used=0; for(int i=0;i<5;i++) if(p==outs[i]) used=1;
-            if(used) continue;
-            if(gpio_get_level(p)!=before[p]) toggled[p]=1;
-            after[p]=gpio_get_level(p);
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    bb_cmd(0x02);
-    for(int p=0;p<=23;p++){
-        int used=0; for(int i=0;i<5;i++) if(p==outs[i]) used=1;
-        if(used) continue;
-        printf("    IO%-2d before=%d after=%d %s\n", p, before[p], after[p],
-               toggled[p] ? "<<< TOGGLED" : "");
-    }
-}
-
-static void epd_full_test(void) {
-    printf("\n--- E-paper WFT0154CZ17 / IL0373 152x152 pin scan ---\n");
-    printf("  known: RST=IO%d BUSY=IO%d; scanning DCX/CS/SCLK/MOSI among free GPIOs\n",
-           EPD_RST, EPD_BUSY);
-
-    /* Scan candidate combinations. GPIO pool from the schematic + shared SPI lines.
-     * FPC gives IO4/IO5/IO14; SD shares IO20/IO21. Try all distinct assignments. */
-    const int pool[] = { 4, 5, 14, 20, 21 };
-    int found = 0, fdc=0, fcs=0, fclk=0, fmosi=0, fres=0;
-    for (int a = 0; a < 5 && !found; a++)
-      for (int b = 0; b < 5 && !found; b++)
-        for (int c = 0; c < 5 && !found; c++)
-          for (int d = 0; d < 5 && !found; d++) {
-            int dc = pool[a], cs = pool[b], clk = pool[c], mosi = pool[d];
-            if (dc==cs || dc==clk || dc==mosi || cs==clk || cs==mosi || clk==mosi) continue;
-            int r = epd_probe_one(dc, cs, clk, mosi);
-            if (r) {
-                printf("  >> RESPONSE dc=%d cs=%d clk=%d mosi=%d busy_during_poweron=%d\n",
-                       dc, cs, clk, mosi, r-10);
-                found=1; fdc=dc; fcs=cs; fclk=clk; fmosi=mosi; fres=r-10;
-            }
-          }
-
-    if (!found) {
-        printf("  PIN SCAN: no combination toggled BUSY on IO%d.\n", EPD_BUSY);
-        epd_busy_pin_scan();
-        printf("  No combination worked. Verify FPC insertion + 3.3V + panel wiring.\n");
-        return;
-    }
-    printf("  PIN SCAN SUCCESS: DCX=%d CS=%d SCLK=%d MOSI=%d\n", fdc, fcs, fclk, fmosi);
-
-    /* Full refresh with the discovered pins */
-    g_dcx=fdc; g_cs=fcs; g_sclk=fclk; g_mosi=fmosi;
-    gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_direction(EPD_BUSY, GPIO_MODE_INPUT);
     gpio_set_pull_mode(EPD_BUSY, GPIO_PULLUP_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    printf("  before reset: BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
-    bb_cmd(0x01); bb_d1(0x03); bb_d1(0x00); bb_d1(0x2b); bb_d1(0x2b); bb_d1(0x03);
-    bb_cmd(0x06); bb_d1(0x17); bb_d1(0x17); bb_d1(0x17);
-    bb_cmd(0x00); bb_d1(0xbf); bb_d1(0x0d);
-    bb_cmd(0x30); bb_d1(0x3a);
-    bb_cmd(0x61); bb_d1(EPD_W); bb_d1(0x00); bb_d1(EPD_H);
+    // hardware reset: low 2ms, high 20ms (GxEPD2 _reset)
+    gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
+    printf("  after reset : BUSY=%d\n", gpio_get_level(EPD_BUSY));
+
+    // ---- _InitDisplay ----
+    bb_cmd(0x01); bb_d1(0x03); bb_d1(0x00); bb_d1(0x2b); bb_d1(0x2b); bb_d1(0x03); // power setting
+    bb_cmd(0x06); bb_d1(0x17); bb_d1(0x17); bb_d1(0x17);                             // boost soft start
+    bb_cmd(0x00); bb_d1(0xbf); bb_d1(0x0d);                                          // panel: LUT from reg
+    bb_cmd(0x30); bb_d1(0x3a);                                                       // PLL
+    bb_cmd(0x61); bb_d1(EPD_W); bb_d1(0x00); bb_d1(EPD_H);                           // 152x152
+    // ---- _Init_Full: VCOM + 5 LUTs ----
     bb_cmd(0x82); bb_d1(0x08);
     bb_cmd(0x50); bb_d1(0x97);
     bb_cmd(0x20); bb_data(lut_vcom, sizeof(lut_vcom));
@@ -364,24 +271,29 @@ static void epd_full_test(void) {
     bb_cmd(0x22); bb_data(lut_bw,   sizeof(lut_bw));
     bb_cmd(0x23); bb_data(lut_wb,   sizeof(lut_wb));
     bb_cmd(0x24); bb_data(lut_bb,   sizeof(lut_bb));
+    printf("  init + LUT sent, BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
+    // ---- RAM: 152x152/8 = 2888 bytes per plane ----
     static uint8_t frame[EPD_BPL * EPD_H];
     memset(frame, 0xFF, sizeof(frame));
-    bb_cmd(0x10); bb_data(frame, sizeof(frame));
+    bb_cmd(0x10); bb_data(frame, sizeof(frame));   // previous = white
     for (int y = 0; y < EPD_H; y++)
         for (int x = 0; x < EPD_BPL; x++)
-            frame[y*EPD_BPL+x] = (((x/2 + y/10) & 1) ? 0x00 : 0xFF);
-    bb_cmd(0x13); bb_data(frame, sizeof(frame));
+            frame[y*EPD_BPL+x] = (((x/2 + y/10) & 1) ? 0x00 : 0xFF); // stripes
+    bb_cmd(0x13); bb_data(frame, sizeof(frame));   // current = pattern
+    printf("  2x2888 bytes RAM written, BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
-    bool lo=false;
-    bb_cmd(0x04); int t1=epd_wait_busy(4000,&lo);
-    printf("  power-on: %dms BUSY=%d\n", t1, gpio_get_level(EPD_BUSY));
+    bool lo1=false, lo2=false, lo3=false;
+    bb_cmd(0x04); int t1 = epd_wait_busy(4000, &lo1);
+    printf("  power-on : %dms BUSY=%d saw_low=%d\n", t1, gpio_get_level(EPD_BUSY), lo1);
     bb_cmd(0x12); vTaskDelay(pdMS_TO_TICKS(100));
-    lo=false; int t2=epd_wait_busy(8000,&lo);
-    printf("  refresh : %dms BUSY=%d saw_low=%d\n", t2, gpio_get_level(EPD_BUSY), lo);
-    bb_cmd(0x02); epd_wait_busy(3000,NULL);
-    bb_cmd(0x07); bb_d1(0xA5);
-    printf("  EPD RESULT: %s\n", (fres==0) ? "panel pulled BUSY LOW during power-on (expected idle=HIGH)" : "panel toggled BUSY HIGH (inverted polarity?) - refresh attempted");
+    int t2 = epd_wait_busy(8000, &lo2);
+    printf("  refresh  : %dms BUSY=%d saw_low=%d\n", t2, gpio_get_level(EPD_BUSY), lo2);
+    bb_cmd(0x02); int t3 = epd_wait_busy(3000, &lo3);
+    printf("  power-off: %dms BUSY=%d saw_low=%d\n", t3, gpio_get_level(EPD_BUSY), lo3);
+    bb_cmd(0x07); bb_d1(0xA5);   // deep sleep
+
+    printf("  EPD RESULT: %s\n", (lo1||lo2||lo3) ? "RESPONSIVE (BUSY asserted LOW)" : "NO RESPONSE (BUSY stayed HIGH)");
 }
 
 /* ---------- SD card via SDSPI (C6 has no SDMMC host) ---------- */
@@ -399,8 +311,8 @@ static void sd_test(void) {
 
     sdspi_device_config_t dc = SDSPI_DEVICE_CONFIG_DEFAULT();
     dc.host_id = SPI2_HOST;
-    dc.gpio_cs = SD_CS;          // CD/DAT3 doubles as CS in SPI mode
-    dc.gpio_cd = GPIO_NUM_NC;    // avoid conflict with CS
+    dc.gpio_cs = SD_CS;
+    dc.gpio_cd = GPIO_NUM_NC;
     sdspi_dev_handle_t dh;
     e = sdspi_host_init_device(&dc, &dh);
     if (e != ESP_OK) { printf("  SDSPI device init FAILED: %s\n", esp_err_to_name(e)); return; }
@@ -413,9 +325,9 @@ static void sd_test(void) {
     e = sdmmc_card_init(&host, &card);
     if (e == ESP_OK) {
         uint64_t mb = (uint64_t)card.csd.capacity * card.csd.sector_size / (1024*1024);
-        printf("  SD OK: name=%.8s type=%s%s capacity=%llu MB\n",
+        printf("  SD OK: name=%.8s type=%s capacity=%llu MB\n",
                card.cid.name, card.is_sdio ? "SDIO" : (card.is_mmc ? "MMC" : "SD"),
-               "", (unsigned long long)mb);
+               (unsigned long long)mb);
     } else {
         printf("  SD init FAILED: %s (0x%x)\n", esp_err_to_name(e), e);
     }
@@ -498,12 +410,12 @@ void app_main(void) {
     esp_err_t r = i2c_new_master_bus(&bc, &bus);
     printf("I2C bus init: %s\n", esp_err_to_name(r));
 
-    const int inputs[] = { BTN_BOOT, BTN_DOWN, BTN_GPIO2, EPD_BUSY };
+    const int inputs[] = { BTN_BOOT, BTN_DOWN, BTN_GPIO2, RTC_INT, EPD_BUSY };
     for (unsigned i = 0; i < sizeof(inputs)/sizeof(inputs[0]); i++) {
         gpio_set_direction(inputs[i], GPIO_MODE_INPUT);
         gpio_set_pull_mode(inputs[i], GPIO_PULLUP_ONLY);
     }
-    const int outputs[] = { EPD_RST, EPD_IO4, EPD_IO5, EPD_CS };
+    const int outputs[] = { EPD_DC, EPD_MOSI, EPD_SCLK, EPD_CS, EPD_RST };
     for (unsigned i = 0; i < sizeof(outputs)/sizeof(outputs[0]); i++) {
         gpio_set_direction(outputs[i], GPIO_MODE_OUTPUT);
         gpio_set_level(outputs[i], 1);
