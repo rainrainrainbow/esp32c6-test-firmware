@@ -82,20 +82,14 @@ static void i2c_scan_and_read(void) {
     };
     int found = 0;
     for (uint8_t addr = 1; addr < 127; addr++) {
-        i2c_device_config_t dev = { .dev_addr_length = I2C_ADDR_BIT_7,
-                                    .device_address = addr, .scl_speed_hz = 100000 };
-        i2c_master_dev_handle_t h;
-        if (i2c_master_bus_add_device(bus, &dev, &h) != ESP_OK) continue;
-        uint8_t b[1] = {0};
-        esp_err_t r = i2c_master_transmit_receive(h, NULL, 0, b, 1, 100);
+        esp_err_t r = i2c_master_probe(bus, addr, 100);
         if (r == ESP_OK) {
-            printf("  [0x%02X] ACK reg0=0x%02X", addr, b[0]);
+            printf("  [0x%02X] ACK", addr);
             for (unsigned i = 0; i < sizeof(known)/sizeof(known[0]); i++)
                 if (known[i].addr == addr) printf(" <- %s", known[i].name);
             printf("\n");
             found++;
         }
-        i2c_master_bus_rm_device(h);
     }
     printf("  I2C devices found: %d\n", found);
 
@@ -109,7 +103,8 @@ static void i2c_scan_and_read(void) {
             uint8_t cmd[3] = {0xAC, 0x33, 0x00}, d[6] = {0};
             i2c_master_transmit(h, cmd, 3, 100);
             vTaskDelay(pdMS_TO_TICKS(90));
-            if (i2c_master_transmit_receive(h, NULL, 0, d, 6, 200) == ESP_OK && !(d[0] & 0x80)) {
+            uint8_t dummy = 0;
+            if (i2c_master_transmit_receive(h, &dummy, 0, d, 6, 200) == ESP_OK && !(d[0] & 0x80)) {
                 uint32_t rh = ((uint32_t)d[1]<<12)|((uint32_t)d[2]<<4)|(d[3]>>4);
                 uint32_t tp = (((uint32_t)d[3]&0x0F)<<16)|((uint32_t)d[4]<<8)|d[5];
                 printf("  AHT20: T=%.2fC RH=%.2f%% (status=0x%02X)\n",
