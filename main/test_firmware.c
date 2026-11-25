@@ -273,6 +273,47 @@ static int epd_probe_one(int dc, int cs, int sclk, int mosi) {
     bb_cmd(0x02);  // power off
     return saw >= 0 ? (saw + 10) : 0;
 }
+/* Scan every GPIO as a possible BUSY line while issuing power-on with a
+ * fixed best-guess SPI mapping. Reports which pins ever toggled. */
+static void epd_busy_pin_scan(void) {
+    printf("\n  [BUSY pin scan] issuing power-on, watching all GPIOs:\n");
+    // use a best-guess mapping (DCX=4 CS=14 CLK=21 MOSI=20), bit-bang
+    g_dcx=4; g_cs=14; g_sclk=21; g_mosi=20;
+    const int outs[5]={4,14,21,20,EPD_RST};
+    for (int i=0;i<5;i++){ gpio_set_direction(outs[i],GPIO_MODE_OUTPUT); gpio_set_level(outs[i],1); }
+    // all other GPIOs as floating inputs
+    for (int p=0;p<=23;p++) {
+        int used=0; for(int i=0;i<5;i++) if(p==outs[i]) used=1;
+        if(!used){ gpio_set_direction(p,GPIO_MODE_INPUT); gpio_set_pull_mode(p,GPIO_FLOATING); }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+    gpio_set_level(EPD_RST,0); vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(EPD_RST,1); vTaskDelay(pdMS_TO_TICKS(20));
+
+    static int before[24], after[24], toggled[24];
+    for(int p=0;p<=23;p++){ before[p]=gpio_get_level(p); toggled[p]=0; }
+    bb_cmd(0x00); bb_d1(0x1f);
+    bb_cmd(0x01); bb_d1(0x03); bb_d1(0x00); bb_d1(0x2b); bb_d1(0x2b); bb_d1(0x03);
+    bb_cmd(0x61); bb_d1(EPD_W); bb_d1(0x00); bb_d1(EPD_H);
+    bb_cmd(0x04);
+    for(int t=0;t<200;t++){
+        for(int p=0;p<=23;p++){
+            int used=0; for(int i=0;i<5;i++) if(p==outs[i]) used=1;
+            if(used) continue;
+            if(gpio_get_level(p)!=before[p]) toggled[p]=1;
+            after[p]=gpio_get_level(p);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    bb_cmd(0x02);
+    for(int p=0;p<=23;p++){
+        int used=0; for(int i=0;i<5;i++) if(p==outs[i]) used=1;
+        if(used) continue;
+        printf("    IO%-2d before=%d after=%d %s\n", p, before[p], after[p],
+               toggled[p] ? "<<< TOGGLED" : "");
+    }
+}
+
 static void epd_full_test(void) {
     printf("\n--- E-paper WFT0154CZ17 / IL0373 152x152 pin scan ---\n");
     printf("  known: RST=IO%d BUSY=IO%d; scanning DCX/CS/SCLK/MOSI among free GPIOs\n",
@@ -297,8 +338,9 @@ static void epd_full_test(void) {
           }
 
     if (!found) {
-        printf("  PIN SCAN: no combination toggled BUSY. Panel not driving BUSY on IO%d.\n", EPD_BUSY);
-        printf("  Try BUSY on another GPIO / verify FPC insertion + 3.3V.\n");
+        printf("  PIN SCAN: no combination toggled BUSY on IO%d.\n", EPD_BUSY);
+        epd_busy_pin_scan();
+        printf("  No combination worked. Verify FPC insertion + 3.3V + panel wiring.\n");
         return;
     }
     printf("  PIN SCAN SUCCESS: DCX=%d CS=%d SCLK=%d MOSI=%d\n", fdc, fcs, fclk, fmosi);
