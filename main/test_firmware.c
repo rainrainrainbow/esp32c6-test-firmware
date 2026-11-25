@@ -103,8 +103,7 @@ static void i2c_scan_and_read(void) {
             uint8_t cmd[3] = {0xAC, 0x33, 0x00}, d[6] = {0};
             i2c_master_transmit(h, cmd, 3, 100);
             vTaskDelay(pdMS_TO_TICKS(90));
-            uint8_t dummy = 0;
-            if (i2c_master_transmit_receive(h, &dummy, 0, d, 6, 200) == ESP_OK && !(d[0] & 0x80)) {
+            if (i2c_master_receive(h, d, 6, 200) == ESP_OK && !(d[0] & 0x80)) {
                 uint32_t rh = ((uint32_t)d[1]<<12)|((uint32_t)d[2]<<4)|(d[3]>>4);
                 uint32_t tp = (((uint32_t)d[3]&0x0F)<<16)|((uint32_t)d[4]<<8)|d[5];
                 printf("  AHT20: T=%.2fC RH=%.2f%% (status=0x%02X)\n",
