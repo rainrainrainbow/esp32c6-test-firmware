@@ -176,15 +176,94 @@ static void buzzer_beep(void) {
     printf("  beeped 3x @2kHz\n");
 }
 
-/* ---------- EPD GPIO ---------- */
-static void epd_probe(void) {
-    printf("\n--- E-paper GPIO (FPC-24P) ---\n");
-    printf("  RST(IO0)=%d BUSY(IO1)=%d IO4=%d IO5=%d CS(IO14)=%d\n",
-           gpio_get_level(EPD_RST), gpio_get_level(EPD_BUSY), gpio_get_level(EPD_IO4),
-           gpio_get_level(EPD_IO5), gpio_get_level(EPD_CS));
-    gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(10));
+/* ---------- EPD real refresh (UC8176 / SSD168x compatible, 400x300) ----------
+ * FPC-24P only exposes RST/BUSY/CS + two GPIOs, so SCLK/MOSI are shared with
+ * the SD slot on SPI2: SCLK=IO21, MOSI=IO20; DCX=IO4, CS=IO14 (or IO5 fallback).
+ * BUSY: LOW = busy, HIGH = idle (UC8176 / SSD168x).
+ */
+#define EPD_SCLK 21
+#define EPD_MOSI 20
+#define EPD_DC   4
+#define EPD_CS2  5
+
+static spi_device_handle_t epd_dev_h;
+
+static void epd_cmd(uint8_t c) {
+    gpio_set_level(EPD_DC, 0);
+    gpio_set_level(EPD_CS, 0);
+    spi_transaction_t t = { .length = 8, .tx_buffer = &c };
+    spi_device_polling_transmit(epd_dev_h, &t);
+    gpio_set_level(EPD_CS, 1);
+}
+static void epd_data(const uint8_t *d, size_t len) {
+    gpio_set_level(EPD_DC, 1);
+    gpio_set_level(EPD_CS, 0);
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off; if (chunk > 1024) chunk = 1024;
+        spi_transaction_t t = { .length = chunk * 8, .tx_buffer = d + off };
+        esp_err_t e = spi_device_polling_transmit(epd_dev_h, &t);
+        if (e != ESP_OK) { printf("  EPD spi err: %s\n", esp_err_to_name(e)); break; }
+        off += chunk;
+    }
+    gpio_set_level(EPD_CS, 1);
+}
+/* returns ms waited; *saw_low tells whether BUSY ever asserted */
+static int epd_wait_busy(int max_ms, bool *saw_low) {
+    int t = 0;
+    while (gpio_get_level(EPD_BUSY) == 0) { if (saw_low) *saw_low = true; if (t >= max_ms) break; vTaskDelay(pdMS_TO_TICKS(10)); t += 10; }
+    return t;
+}
+static void epd_full_test(void) {
+    printf("\n--- E-paper full refresh (SCLK=%d MOSI=%d DCX=%d CS=%d) ---\n",
+           EPD_SCLK, EPD_MOSI, EPD_DC, EPD_CS);
+    printf("  before reset: BUSY=%d RST=%d\n", gpio_get_level(EPD_BUSY), gpio_get_level(EPD_RST));
+
+    // hardware reset: 3 pulses (UC8176 datasheet)
     gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(10));
-    printf("  after RST pulse: BUSY=%d\n", gpio_get_level(EPD_BUSY));
+    for (int i = 0; i < 3; i++) {
+        gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    printf("  after reset: BUSY=%d\n", gpio_get_level(EPD_BUSY));
+
+    spi_bus_config_t sb = { .mosi_io_num = EPD_MOSI, .miso_io_num = -1, .sclk_io_num = EPD_SCLK,
+                            .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 2048 };
+    esp_err_t e = spi_bus_initialize(SPI2_HOST, &sb, SDSPI_DEFAULT_DMA);
+    if (e != ESP_OK) { printf("  EPD SPI bus init FAILED: %s\n", esp_err_to_name(e)); return; }
+    spi_device_interface_config_t dc = { .command_bits = 0, .address_bits = 0,
+                                         .mode = 0, .clock_speed_hz = 2000000,
+                                         .spics_io_num = -1, .queue_size = 2 };
+    e = spi_bus_add_device(SPI2_HOST, &dc, &epd_dev_h);
+    if (e != ESP_OK) { printf("  EPD dev add FAILED: %s\n", esp_err_to_name(e)); spi_bus_free(SPI2_HOST); return; }
+
+    // UC8176 400x300 B/W, LUT from OTP (from proven nRF5 driver)
+    epd_cmd(0x00); epd_data((const uint8_t *)(uint8_t[]){0x1F}, 1);  // panel setting
+    epd_cmd(0x50); epd_data((const uint8_t *)(uint8_t[]){0x97}, 1);  // VCOM/data interval
+    printf("  init commands sent, BUSY=%d\n", gpio_get_level(EPD_BUSY));
+
+    // RAM: 400x300 / 8 = 15000 bytes per plane
+    static uint8_t frame[15000];
+    memset(frame, 0xFF, sizeof(frame));           // white
+    epd_cmd(0x10); epd_data(frame, sizeof(frame)); // old data
+    for (int y = 0; y < 300; y++)                  // checkerboard on new data
+        for (int x = 0; x < 50; x++)
+            frame[y * 50 + x] = (((x / 5 + y / 10) & 1) ? 0x00 : 0xFF);
+    epd_cmd(0x13); epd_data(frame, sizeof(frame)); // new data
+    printf("  2x15000 bytes RAM written, BUSY=%d\n", gpio_get_level(EPD_BUSY));
+
+    bool low1 = false, low2 = false, low3 = false;
+    epd_cmd(0x04); int t1 = epd_wait_busy(6000, &low1);  // power on
+    printf("  power-on  : wait=%dms BUSY=%d saw_low=%d\n", t1, gpio_get_level(EPD_BUSY), low1);
+    epd_cmd(0x12); vTaskDelay(pdMS_TO_TICKS(100));
+    int t2 = epd_wait_busy(15000, &low2);                // display refresh
+    printf("  refresh   : wait=%dms BUSY=%d saw_low=%d\n", t2, gpio_get_level(EPD_BUSY), low2);
+    epd_cmd(0x02); int t3 = epd_wait_busy(6000, &low3);  // power off
+    printf("  power-off : wait=%dms BUSY=%d saw_low=%d\n", t3, gpio_get_level(EPD_BUSY), low3);
+
+    spi_bus_remove_device(epd_dev_h);
+    spi_bus_free(SPI2_HOST);
+    printf("  EPD result: %s\n", (low1 || low2 || low3) ? "RESPONSIVE (BUSY asserted)" : "NO RESPONSE (BUSY never asserted)");
 }
 
 /* ---------- SD card via SDSPI (C6 has no SDMMC host) ---------- */
@@ -271,7 +350,7 @@ static void run_tests(void) {
     i2c_scan_and_read();
     buttons_test();
     buzzer_beep();
-    epd_probe();
+    epd_full_test();
     sd_test();
     i2s_mic_test();
     printf("\n==== test cycle done ====\n");
