@@ -280,18 +280,14 @@ static void epd_full_test(void) {
     // ---- _InitDisplay ----
     epd_cmd(0x01); epd_d1(0x03); epd_d1(0x00); epd_d1(0x2b); epd_d1(0x2b); epd_d1(0x03);
     epd_cmd(0x06); epd_d1(0x17); epd_d1(0x17); epd_d1(0x17);
-    epd_cmd(0x00); epd_d1(0xbf); epd_d1(0x0d);
+    // Try OTP LUT (0x1f) - WFT0154CZ17 may be OTP variant, not the external-LUT
+    // fast-partial GDEW0154T8 (0xbf). OTP needs no LUT download.
+    epd_cmd(0x00); epd_d1(0x1f); epd_d1(0x0d);
     epd_cmd(0x30); epd_d1(0x3a);
     epd_cmd(0x61); epd_d1(EPD_W); epd_d1(0x00); epd_d1(EPD_H);
-    // ---- _Init_Full: VCOM + 5 LUTs ----
     epd_cmd(0x82); epd_d1(0x08);
     epd_cmd(0x50); epd_d1(0x97);
-    epd_cmd(0x20); epd_data(lut_vcom, sizeof(lut_vcom));
-    epd_cmd(0x21); epd_data(lut_ww,   sizeof(lut_ww));
-    epd_cmd(0x22); epd_data(lut_bw,   sizeof(lut_bw));
-    epd_cmd(0x23); epd_data(lut_wb,   sizeof(lut_wb));
-    epd_cmd(0x24); epd_data(lut_bb,   sizeof(lut_bb));
-    printf("  init+LUT sent, BUSY=%d\n", gpio_get_level(EPD_BUSY));
+    printf("  init (OTP LUT 0x1f) sent, BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
     // ---- RAM ----
     static uint8_t frame[EPD_BPL * EPD_H];
