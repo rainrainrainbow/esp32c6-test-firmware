@@ -240,6 +240,27 @@ static int epd_wait_busy(int max_ms, bool *saw_low) {
 static void epd_full_test(void) {
     printf("\n--- E-paper IL0373 152x152 (SCLK=%d MOSI=%d DCX=%d CS=%d) ---\n",
            EPD_SCLK, EPD_MOSI, EPD_DC, EPD_CS);
+
+    // ---- GPIO drive diagnostics: is anything pulling these lines? ----
+    printf("  [GPIO drive test] write0/read, write1/read:\n");
+    const int dpins[] = { EPD_RST, EPD_IO4, EPD_IO5, EPD_CS, EPD_SCLK, EPD_MOSI };
+    const char *dnames[] = { "RST/IO0", "IO4", "IO5", "CS/IO14", "SCLK/IO21", "MOSI/IO20" };
+    for (unsigned i = 0; i < sizeof(dpins)/sizeof(dpins[0]); i++) {
+        gpio_set_direction(dpins[i], GPIO_MODE_OUTPUT);
+        gpio_set_level(dpins[i], 0); vTaskDelay(pdMS_TO_TICKS(2)); int lo = gpio_get_level(dpins[i]);
+        gpio_set_level(dpins[i], 1); vTaskDelay(pdMS_TO_TICKS(2)); int hi = gpio_get_level(dpins[i]);
+        printf("    %-10s lo=%d hi=%d %s\n", dnames[i], lo, hi,
+               (lo==0 && hi==1) ? "OK" : "<<< externally held");
+    }
+    // ---- BUSY input: floating vs pull-up vs pull-down tells if panel drives it ----
+    gpio_set_direction(EPD_BUSY, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(EPD_BUSY, GPIO_FLOATING); vTaskDelay(pdMS_TO_TICKS(2)); int bf = gpio_get_level(EPD_BUSY);
+    gpio_set_pull_mode(EPD_BUSY, GPIO_PULLUP_ONLY); vTaskDelay(pdMS_TO_TICKS(2)); int bu = gpio_get_level(EPD_BUSY);
+    gpio_set_pull_mode(EPD_BUSY, GPIO_PULLDOWN_ONLY); vTaskDelay(pdMS_TO_TICKS(2)); int bd = gpio_get_level(EPD_BUSY);
+    printf("  [BUSY input] floating=%d pullup=%d pulldown=%d %s\n", bf, bu, bd,
+           (bu==bd) ? "=> panel DRIVING busy" : "=> busy FLOATING (no panel driver)");
+    gpio_set_pull_mode(EPD_BUSY, GPIO_PULLUP_ONLY);
+
     printf("  before reset: BUSY=%d RST=%d IO5=%d\n",
            gpio_get_level(EPD_BUSY), gpio_get_level(EPD_RST), gpio_get_level(EPD_IO5));
 
