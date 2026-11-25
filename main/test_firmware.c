@@ -7,7 +7,7 @@
 //                            MPU6500(0x68/0x69) MMC5603NJ(0x30)
 //   RTC_INT=IO19   Buzzer=IO18
 //   TF   CS=IO8 MOSI=IO20 CLK=IO21 MISO=IO22 (SDSPI; C6 has no SDMMC host)
-//   I2S mic ICS-43434: SCK=IO16 WS=IO17 SD=IO23
+//   I2S mic ICS-43434: NOT installed on this board (pins kept for reference)
 //   USB: D-=IO12 D+=IO13
 #include <stdio.h>
 #include <string.h>
@@ -234,6 +234,7 @@ static void epd_data(const uint8_t *d, size_t n) {
 static void epd_d1(uint8_t v) { epd_data(&v, 1); }
 
 /* IL0373: LOW=busy, HIGH=idle. Returns ms waited; sets saw_low if BUSY was ever LOW. */
+static int epd_wait_busy(int max_ms, bool *saw_low) __attribute__((unused));
 static int epd_wait_busy(int max_ms, bool *saw_low) {
     int t = 0;
     bool low = false;
@@ -246,20 +247,21 @@ static int epd_wait_busy(int max_ms, bool *saw_low) {
     return t;
 }
 
-static void epd_full_test(void) {
-    printf("\n--- E-paper WFT0154CZ17 / IL0373 152x152 (HW SPI) ---\n");
-    printf("  DC=IO%d BUSY=IO%d RST=IO%d CS=IO%d MOSI=IO%d SCLK=IO%d\n",
+/* FORCE mode: BUSY line is completely ignored. No gpio_get_level(EPD_BUSY)
+ * anywhere in this function. Fixed delays replace every busy-wait.
+ * Full GxEPD2_154_T8 init (0xBF + register LUTs) + high-contrast pattern.
+ */
+static void epd_force_refresh(void) {
+    printf("\n--- EPD FORCE REFRESH (BUSY IGNORED) ---\n");
+    printf("  panel=WFT0154CZ17 IL0373 152x152 B/W\n");
+    printf("  DC=IO%d BUSY=IO%d(IGNORED) RST=IO%d CS=IO%d MOSI=IO%d SCLK=IO%d\n",
            EPD_DC, EPD_BUSY, EPD_RST, EPD_CS, EPD_MOSI, EPD_SCLK);
 
-    // configure control pins
+    // BUSY is deliberately NOT configured as an input: the line is ignored.
     gpio_set_direction(EPD_DC, GPIO_MODE_OUTPUT);  gpio_set_level(EPD_DC, 1);
     gpio_set_direction(EPD_CS, GPIO_MODE_OUTPUT);  gpio_set_level(EPD_CS, 1);
     gpio_set_direction(EPD_RST, GPIO_MODE_OUTPUT); gpio_set_level(EPD_RST, 1);
-    gpio_set_direction(EPD_BUSY, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(EPD_BUSY, GPIO_PULLUP_ONLY);
-    vTaskDelay(pdMS_TO_TICKS(10));
 
-    // init hardware SPI: mode0, MSB first, 4MHz (GxEPD2 uses 4-10MHz)
     spi_bus_config_t sb = { .mosi_io_num = EPD_MOSI, .miso_io_num = -1,
                             .sclk_io_num = EPD_SCLK, .quadwp_io_num = -1, .quadhd_io_num = -1,
                             .max_transfer_sz = 4096 };
@@ -269,87 +271,55 @@ static void epd_full_test(void) {
         .clock_speed_hz=4000000, .spics_io_num=-1, .queue_size=3 };
     e = spi_bus_add_device(SPI2_HOST, &dc, &epd_spi);
     if (e != ESP_OK) { printf("  SPI dev add FAILED: %s\n", esp_err_to_name(e)); spi_bus_free(SPI2_HOST); return; }
-    printf("  SPI bus ready (4MHz mode0)\n");
+    printf("  SPI ready (4MHz mode0)\n");
 
-    // GxEPD2 _reset(): HIGH 20ms -> LOW 2ms -> HIGH 20ms
+    // GxEPD2 _reset()
     gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(5));
     gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
-    printf("  after reset: BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
-    // ---- _InitDisplay ----
+    // ---- _InitDisplay: LUT from registers (0xBF), exact GxEPD2_154_T8 values ----
     epd_cmd(0x01); epd_d1(0x03); epd_d1(0x00); epd_d1(0x2b); epd_d1(0x2b); epd_d1(0x03);
     epd_cmd(0x06); epd_d1(0x17); epd_d1(0x17); epd_d1(0x17);
-    // Try OTP LUT (0x1f) - WFT0154CZ17 may be OTP variant, not the external-LUT
-    // fast-partial GDEW0154T8 (0xbf). OTP needs no LUT download.
-    epd_cmd(0x00); epd_d1(0x1f); epd_d1(0x0d);
+    epd_cmd(0x00); epd_d1(0xbf); epd_d1(0x0d);
     epd_cmd(0x30); epd_d1(0x3a);
-    epd_cmd(0x61); epd_d1(EPD_W); epd_d1(0x00); epd_d1(EPD_H);
+    epd_cmd(0x61); epd_d1(0x98); epd_d1(0x00); epd_d1(0x98);
     epd_cmd(0x82); epd_d1(0x08);
     epd_cmd(0x50); epd_d1(0x97);
-    printf("  init (OTP LUT 0x1f) sent, BUSY=%d\n", gpio_get_level(EPD_BUSY));
+    epd_cmd(0x20); epd_data(lut_vcom, sizeof(lut_vcom));
+    epd_cmd(0x21); epd_data(lut_ww,   sizeof(lut_ww));
+    epd_cmd(0x22); epd_data(lut_bw,   sizeof(lut_bw));
+    epd_cmd(0x23); epd_data(lut_wb,   sizeof(lut_wb));
+    epd_cmd(0x24); epd_data(lut_bb,   sizeof(lut_bb));
+    printf("  init + 5 LUTs sent\n");
 
-    // ---- RAM ----
+    // High-contrast checkerboard (~16x19 px squares) so any response is obvious.
     static uint8_t frame[EPD_BPL * EPD_H];
-    memset(frame, 0xFF, sizeof(frame));
-    epd_cmd(0x10); epd_data(frame, sizeof(frame));
-    for (int y = 0; y < EPD_H; y++)
-        for (int x = 0; x < EPD_BPL; x++)
-            frame[y*EPD_BPL+x] = (((x/2 + y/10) & 1) ? 0x00 : 0xFF);
-    epd_cmd(0x13); epd_data(frame, sizeof(frame));
-    printf("  RAM written, BUSY=%d\n", gpio_get_level(EPD_BUSY));
-
-    // ---- power on + monitor BUSY + scan all GPIOs for the real BUSY line ----
-    // Snapshot GPIOs SAFE to touch (exclude USB 12/13, strapping 2/8/9, I2C 6/7,
-    // SD 20/21/22, I2S 16/17/23, buzzer 18, RTC_INT 19, buttons 3/9, and driven EPD pins).
-    const int driven[] = { EPD_DC, EPD_CS, EPD_RST, EPD_MOSI, EPD_SCLK };
-    const int reserved[] = { 2,3,6,7,8,9,12,13,16,17,18,19,20,21,22,23 };
-    const int scan[] = { 0,1,4,5,10,11,14,15 };  // only safe candidates
-    static int before[32], changed[32];
-    for (unsigned k = 0; k < sizeof(scan)/sizeof(scan[0]); k++) {
-        int p = scan[k];
-        int used = 0;
-        for (unsigned i = 0; i < sizeof(driven)/sizeof(driven[0]); i++) if (p == driven[i]) used = 1;
-        for (unsigned i = 0; i < sizeof(reserved)/sizeof(reserved[0]); i++) if (p == reserved[i]) used = 1;
-        if (!used) {
-            gpio_set_direction(p, GPIO_MODE_INPUT);
-            gpio_set_pull_mode(p, GPIO_FLOATING);
-            before[p] = gpio_get_level(p);
-        } else before[p] = -1;
-        changed[p] = 0;
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
-
-    epd_cmd(0x04);  // power on
-    int lo = 0;
-    for (int t = 0; t < 120; t++) {  // 6 seconds, 50ms ticks
-        if (gpio_get_level(EPD_BUSY) == 0) lo = 1;
-        for (unsigned k = 0; k < sizeof(scan)/sizeof(scan[0]); k++) {
-            int p = scan[k];
-            if (before[p] < 0) continue;
-            if (gpio_get_level(p) != before[p]) changed[p] = 1;
+    for (int y = 0; y < EPD_H; y++) {
+        for (int x = 0; x < EPD_BPL; x++) {
+            frame[y*EPD_BPL+x] = (((x/2 + y/19) & 1) ? 0x00 : 0xFF);
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
     }
-    printf("  BUSY(IO%d) saw_low=%d now=%d\n", EPD_BUSY, lo, gpio_get_level(EPD_BUSY));
-    printf("  GPIOs that changed during power-on (candidate BUSY):\n");
-    int any = 0;
-    for (unsigned k = 0; k < sizeof(scan)/sizeof(scan[0]); k++) {
-        int p = scan[k];
-        if (before[p] < 0) continue;
-        if (changed[p]) { printf("    IO%d  before=%d now=%d  <<<\n", p, before[p], gpio_get_level(p)); any++; }
-    }
-    if (!any) printf("    (none among safe pins)\n");
+    epd_cmd(0x10); epd_data(frame, sizeof(frame));  // B/W RAM
+    memset(frame, 0xFF, sizeof(frame));
+    epd_cmd(0x13); epd_data(frame, sizeof(frame));  // red RAM (unused on B/W panel)
+    printf("  RAM written (checkerboard)\n");
 
-    epd_cmd(0x12); vTaskDelay(pdMS_TO_TICKS(2000));  // refresh
-    printf("  after refresh: BUSY=%d\n", gpio_get_level(EPD_BUSY));
-    epd_cmd(0x02); vTaskDelay(pdMS_TO_TICKS(100));   // power off
-    epd_cmd(0x07); epd_d1(0xA5);                     // deep sleep
+    // ---- FORCE sequence: pure fixed delays, NO BUSY polling ----
+    printf("  0x04 power-on ...\n");
+    epd_cmd(0x04);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    printf("  0x12 display refresh ...\n");
+    epd_cmd(0x12);
+    vTaskDelay(pdMS_TO_TICKS(6000));
+    printf("  0x02 power-off / 0x07 deep-sleep\n");
+    epd_cmd(0x02); vTaskDelay(pdMS_TO_TICKS(200));
+    epd_cmd(0x07); epd_d1(0xA5);
 
     spi_bus_remove_device(epd_spi);
     spi_bus_free(SPI2_HOST);
     epd_spi = NULL;
-    printf("  EPD RESULT: %s\n", (lo || any) ? "RESPONSIVE (some line asserted)" : "NO RESPONSE (all lines static)");
+    printf("  EPD force-refresh DONE (BUSY never read)\n");
 }
 
 /* ---------- SD card via SDSPI (C6 has no SDMMC host) ---------- */
@@ -391,7 +361,8 @@ static void sd_test(void) {
     spi_bus_free(SPI2_HOST);
 }
 
-/* ---------- I2S mic ---------- */
+/* ---------- I2S mic (NOT populated on this board - kept for reference) ---------- */
+static void i2s_mic_test(void) __attribute__((unused));
 static void i2s_mic_test(void) {
     printf("\n--- I2S mic (ICS-43434: SCK=%d WS=%d SD=%d) ---\n", MIC_SCK, MIC_WS, MIC_SD);
     i2s_chan_config_t cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -433,12 +404,12 @@ done:
 static void run_tests(void) {
     printf("\n==== ESP32-C6 board test @%lld ms ====\n",
            (long long)(esp_timer_get_time()/1000));
+    epd_force_refresh();          // first: screen visible immediately for observation
     i2c_scan_and_read();
     buttons_test();
     buzzer_beep();
-    epd_full_test();
     sd_test();
-    i2s_mic_test();
+    printf("\n  I2S mic: SKIPPED (ICS-43434 not installed on this board)\n");
     printf("\n==== test cycle done ====\n");
 }
 
