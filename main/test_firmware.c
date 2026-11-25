@@ -211,12 +211,15 @@ static const uint8_t lut_bb[42] = {
 static spi_device_handle_t epd_spi = NULL;
 
 static void epd_cmd(uint8_t c) {
+    gpio_set_level(EPD_CS, 0);
     gpio_set_level(EPD_DC, 0);
     spi_transaction_t t = { .length = 8, .tx_buffer = &c };
     esp_err_t e = spi_device_polling_transmit(epd_spi, &t);
+    gpio_set_level(EPD_CS, 1);
     if (e != ESP_OK) printf("  SPI cmd err: %s\n", esp_err_to_name(e));
 }
 static void epd_data(const uint8_t *d, size_t n) {
+    gpio_set_level(EPD_CS, 0);
     gpio_set_level(EPD_DC, 1);
     size_t off = 0;
     while (off < n) {
@@ -226,6 +229,7 @@ static void epd_data(const uint8_t *d, size_t n) {
         if (e != ESP_OK) { printf("  SPI data err: %s\n", esp_err_to_name(e)); break; }
         off += chunk;
     }
+    gpio_set_level(EPD_CS, 1);
 }
 static void epd_d1(uint8_t v) { epd_data(&v, 1); }
 
@@ -299,16 +303,44 @@ static void epd_full_test(void) {
     epd_cmd(0x13); epd_data(frame, sizeof(frame));
     printf("  RAM written, BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
-    // ---- power on + monitor BUSY continuously for 15s ----
-    epd_cmd(0x04);
-    int lo = 0;
-    for (int s = 0; s < 15; s++) {
-        int b = gpio_get_level(EPD_BUSY);
-        if (b == 0) lo = 1;
-        if (s < 3 || b == 0) printf("  t=%2ds BUSY=%d\n", s, b);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // ---- power on + monitor BUSY + scan all GPIOs for the real BUSY line ----
+    // Snapshot every GPIO (except the ones we drive) before power-on
+    const int driven[] = { EPD_DC, EPD_CS, EPD_RST, EPD_MOSI, EPD_SCLK };
+    static int before[24], changed[24];
+    for (int p = 0; p <= 23; p++) {
+        int used = 0;
+        for (unsigned i = 0; i < sizeof(driven)/sizeof(driven[0]); i++) if (p == driven[i]) used = 1;
+        if (!used) {
+            gpio_set_direction(p, GPIO_MODE_INPUT);
+            gpio_set_pull_mode(p, GPIO_FLOATING);
+        }
+        before[p] = gpio_get_level(p);
+        changed[p] = 0;
     }
-    printf("  power-on monitor done: saw_low=%d BUSY=%d\n", lo, gpio_get_level(EPD_BUSY));
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    epd_cmd(0x04);  // power on
+    int lo = 0;
+    for (int t = 0; t < 120; t++) {  // 6 seconds, 50ms ticks
+        if (gpio_get_level(EPD_BUSY) == 0) lo = 1;
+        for (int p = 0; p <= 23; p++) {
+            int used = 0;
+            for (unsigned i = 0; i < sizeof(driven)/sizeof(driven[0]); i++) if (p == driven[i]) used = 1;
+            if (used) continue;
+            if (gpio_get_level(p) != before[p]) changed[p] = 1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    printf("  BUSY(IO%d) saw_low=%d now=%d\n", EPD_BUSY, lo, gpio_get_level(EPD_BUSY));
+    printf("  GPIOs that changed during power-on (candidate BUSY):\n");
+    int any = 0;
+    for (int p = 0; p <= 23; p++) {
+        int used = 0;
+        for (unsigned i = 0; i < sizeof(driven)/sizeof(driven[0]); i++) if (p == driven[i]) used = 1;
+        if (used) continue;
+        if (changed[p]) { printf("    IO%d  before=%d now=%d  <<<\n", p, before[p], gpio_get_level(p)); any++; }
+    }
+    if (!any) printf("    (none)\n");
 
     epd_cmd(0x12); vTaskDelay(pdMS_TO_TICKS(2000));  // refresh
     printf("  after refresh: BUSY=%d\n", gpio_get_level(EPD_BUSY));
@@ -318,7 +350,7 @@ static void epd_full_test(void) {
     spi_bus_remove_device(epd_spi);
     spi_bus_free(SPI2_HOST);
     epd_spi = NULL;
-    printf("  EPD RESULT: %s\n", lo ? "RESPONSIVE (BUSY went LOW)" : "NO RESPONSE (BUSY stayed HIGH)");
+    printf("  EPD RESULT: %s\n", (lo || any) ? "RESPONSIVE (some line asserted)" : "NO RESPONSE (all lines static)");
 }
 
 /* ---------- SD card via SDSPI (C6 has no SDMMC host) ---------- */
