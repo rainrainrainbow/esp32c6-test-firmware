@@ -241,7 +241,7 @@ static void epd_full_test(void) {
     printf("\n--- E-paper IL0373 152x152 (SCLK=%d MOSI=%d DCX=%d CS=%d) ---\n",
            EPD_SCLK, EPD_MOSI, EPD_DC, EPD_CS);
     printf("  before reset: BUSY=%d RST=%d IO5=%d\n",
-           gpio_get_level(EPD_BUSY), gpio_get_level(EPD_RST), gpio_get_level(EPD_CS2));
+           gpio_get_level(EPD_BUSY), gpio_get_level(EPD_RST), gpio_get_level(EPD_IO5));
 
     // hardware reset (GxEPD2 _reset: low 2ms, high 20ms), repeated twice
     for (int i = 0; i < 2; i++) {
