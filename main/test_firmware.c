@@ -205,24 +205,29 @@ static const uint8_t lut_bb[42] = {
     0x80,0x14,0x00,0x00,0x00,0x01, 0x50,0x12,0x12,0x00,0x00,0x01,
     0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00};
 
-/* bit-bang SPI on the confirmed EPD pins (MSB first, mode 0) */
-static inline void bb_byte(uint8_t b) {
-    for (int i = 7; i >= 0; i--) {
-        gpio_set_level(EPD_SCLK, 0);
-        gpio_set_level(EPD_MOSI, (b >> i) & 1);
-        gpio_set_level(EPD_SCLK, 1);
+/* ---- hardware SPI on the confirmed EPD pins (matches official GxEPD2) ----
+ * MOSI=IO4 SCLK=IO5 DC=IO0 CS=IO14 RST=IO15 BUSY=IO1
+ */
+static spi_device_handle_t epd_spi = NULL;
+
+static void epd_cmd(uint8_t c) {
+    gpio_set_level(EPD_DC, 0);
+    spi_transaction_t t = { .length = 8, .tx_buffer = &c };
+    esp_err_t e = spi_device_polling_transmit(epd_spi, &t);
+    if (e != ESP_OK) printf("  SPI cmd err: %s\n", esp_err_to_name(e));
+}
+static void epd_data(const uint8_t *d, size_t n) {
+    gpio_set_level(EPD_DC, 1);
+    size_t off = 0;
+    while (off < n) {
+        size_t chunk = n - off; if (chunk > 2048) chunk = 2048;
+        spi_transaction_t t = { .length = chunk * 8, .tx_buffer = d + off };
+        esp_err_t e = spi_device_polling_transmit(epd_spi, &t);
+        if (e != ESP_OK) { printf("  SPI data err: %s\n", esp_err_to_name(e)); break; }
+        off += chunk;
     }
 }
-static void bb_cmd(uint8_t c) {
-    gpio_set_level(EPD_DC, 0); gpio_set_level(EPD_CS, 0);
-    bb_byte(c); gpio_set_level(EPD_CS, 1);
-}
-static void bb_data(const uint8_t *d, size_t n) {
-    gpio_set_level(EPD_DC, 1); gpio_set_level(EPD_CS, 0);
-    for (size_t i = 0; i < n; i++) bb_byte(d[i]);
-    gpio_set_level(EPD_CS, 1);
-}
-static void bb_d1(uint8_t v) { bb_data(&v, 1); }
+static void epd_d1(uint8_t v) { epd_data(&v, 1); }
 
 /* IL0373: LOW=busy, HIGH=idle. Returns ms waited; sets saw_low if BUSY was ever LOW. */
 static int epd_wait_busy(int max_ms, bool *saw_low) {
@@ -238,62 +243,82 @@ static int epd_wait_busy(int max_ms, bool *saw_low) {
 }
 
 static void epd_full_test(void) {
-    printf("\n--- E-paper WFT0154CZ17 / IL0373 152x152 ---\n");
+    printf("\n--- E-paper WFT0154CZ17 / IL0373 152x152 (HW SPI) ---\n");
     printf("  DC=IO%d BUSY=IO%d RST=IO%d CS=IO%d MOSI=IO%d SCLK=IO%d\n",
            EPD_DC, EPD_BUSY, EPD_RST, EPD_CS, EPD_MOSI, EPD_SCLK);
 
-    const int outs[] = { EPD_DC, EPD_CS, EPD_MOSI, EPD_SCLK, EPD_RST };
-    for (int i = 0; i < 5; i++) {
-        gpio_set_direction(outs[i], GPIO_MODE_OUTPUT);
-        gpio_set_level(outs[i], 1);
-    }
+    // configure control pins
+    gpio_set_direction(EPD_DC, GPIO_MODE_OUTPUT);  gpio_set_level(EPD_DC, 1);
+    gpio_set_direction(EPD_CS, GPIO_MODE_OUTPUT);  gpio_set_level(EPD_CS, 1);
+    gpio_set_direction(EPD_RST, GPIO_MODE_OUTPUT); gpio_set_level(EPD_RST, 1);
     gpio_set_direction(EPD_BUSY, GPIO_MODE_INPUT);
     gpio_set_pull_mode(EPD_BUSY, GPIO_PULLUP_ONLY);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    printf("  before reset: BUSY=%d\n", gpio_get_level(EPD_BUSY));
+    vTaskDelay(pdMS_TO_TICKS(10));
 
-    // hardware reset: low 2ms, high 20ms (GxEPD2 _reset)
+    // init hardware SPI: mode0, MSB first, 4MHz (GxEPD2 uses 4-10MHz)
+    spi_bus_config_t sb = { .mosi_io_num = EPD_MOSI, .miso_io_num = -1,
+                            .sclk_io_num = EPD_SCLK, .quadwp_io_num = -1, .quadhd_io_num = -1,
+                            .max_transfer_sz = 4096 };
+    esp_err_t e = spi_bus_initialize(SPI2_HOST, &sb, SDSPI_DEFAULT_DMA);
+    if (e != ESP_OK) { printf("  SPI bus init FAILED: %s\n", esp_err_to_name(e)); return; }
+    spi_device_interface_config_t dc = { .command_bits=0, .address_bits=0, .mode=0,
+        .clock_speed_hz=4000000, .spics_io_num=-1, .queue_size=3 };
+    e = spi_bus_add_device(SPI2_HOST, &dc, &epd_spi);
+    if (e != ESP_OK) { printf("  SPI dev add FAILED: %s\n", esp_err_to_name(e)); spi_bus_free(SPI2_HOST); return; }
+    printf("  SPI bus ready (4MHz mode0)\n");
+
+    // GxEPD2 _reset(): HIGH 20ms -> LOW 2ms -> HIGH 20ms
+    gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level(EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(2));
     gpio_set_level(EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
-    printf("  after reset : BUSY=%d\n", gpio_get_level(EPD_BUSY));
+    printf("  after reset: BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
     // ---- _InitDisplay ----
-    bb_cmd(0x01); bb_d1(0x03); bb_d1(0x00); bb_d1(0x2b); bb_d1(0x2b); bb_d1(0x03); // power setting
-    bb_cmd(0x06); bb_d1(0x17); bb_d1(0x17); bb_d1(0x17);                             // boost soft start
-    bb_cmd(0x00); bb_d1(0xbf); bb_d1(0x0d);                                          // panel: LUT from reg
-    bb_cmd(0x30); bb_d1(0x3a);                                                       // PLL
-    bb_cmd(0x61); bb_d1(EPD_W); bb_d1(0x00); bb_d1(EPD_H);                           // 152x152
+    epd_cmd(0x01); epd_d1(0x03); epd_d1(0x00); epd_d1(0x2b); epd_d1(0x2b); epd_d1(0x03);
+    epd_cmd(0x06); epd_d1(0x17); epd_d1(0x17); epd_d1(0x17);
+    epd_cmd(0x00); epd_d1(0xbf); epd_d1(0x0d);
+    epd_cmd(0x30); epd_d1(0x3a);
+    epd_cmd(0x61); epd_d1(EPD_W); epd_d1(0x00); epd_d1(EPD_H);
     // ---- _Init_Full: VCOM + 5 LUTs ----
-    bb_cmd(0x82); bb_d1(0x08);
-    bb_cmd(0x50); bb_d1(0x97);
-    bb_cmd(0x20); bb_data(lut_vcom, sizeof(lut_vcom));
-    bb_cmd(0x21); bb_data(lut_ww,   sizeof(lut_ww));
-    bb_cmd(0x22); bb_data(lut_bw,   sizeof(lut_bw));
-    bb_cmd(0x23); bb_data(lut_wb,   sizeof(lut_wb));
-    bb_cmd(0x24); bb_data(lut_bb,   sizeof(lut_bb));
-    printf("  init + LUT sent, BUSY=%d\n", gpio_get_level(EPD_BUSY));
+    epd_cmd(0x82); epd_d1(0x08);
+    epd_cmd(0x50); epd_d1(0x97);
+    epd_cmd(0x20); epd_data(lut_vcom, sizeof(lut_vcom));
+    epd_cmd(0x21); epd_data(lut_ww,   sizeof(lut_ww));
+    epd_cmd(0x22); epd_data(lut_bw,   sizeof(lut_bw));
+    epd_cmd(0x23); epd_data(lut_wb,   sizeof(lut_wb));
+    epd_cmd(0x24); epd_data(lut_bb,   sizeof(lut_bb));
+    printf("  init+LUT sent, BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
-    // ---- RAM: 152x152/8 = 2888 bytes per plane ----
+    // ---- RAM ----
     static uint8_t frame[EPD_BPL * EPD_H];
     memset(frame, 0xFF, sizeof(frame));
-    bb_cmd(0x10); bb_data(frame, sizeof(frame));   // previous = white
+    epd_cmd(0x10); epd_data(frame, sizeof(frame));
     for (int y = 0; y < EPD_H; y++)
         for (int x = 0; x < EPD_BPL; x++)
-            frame[y*EPD_BPL+x] = (((x/2 + y/10) & 1) ? 0x00 : 0xFF); // stripes
-    bb_cmd(0x13); bb_data(frame, sizeof(frame));   // current = pattern
-    printf("  2x2888 bytes RAM written, BUSY=%d\n", gpio_get_level(EPD_BUSY));
+            frame[y*EPD_BPL+x] = (((x/2 + y/10) & 1) ? 0x00 : 0xFF);
+    epd_cmd(0x13); epd_data(frame, sizeof(frame));
+    printf("  RAM written, BUSY=%d\n", gpio_get_level(EPD_BUSY));
 
-    bool lo1=false, lo2=false, lo3=false;
-    bb_cmd(0x04); int t1 = epd_wait_busy(4000, &lo1);
-    printf("  power-on : %dms BUSY=%d saw_low=%d\n", t1, gpio_get_level(EPD_BUSY), lo1);
-    bb_cmd(0x12); vTaskDelay(pdMS_TO_TICKS(100));
-    int t2 = epd_wait_busy(8000, &lo2);
-    printf("  refresh  : %dms BUSY=%d saw_low=%d\n", t2, gpio_get_level(EPD_BUSY), lo2);
-    bb_cmd(0x02); int t3 = epd_wait_busy(3000, &lo3);
-    printf("  power-off: %dms BUSY=%d saw_low=%d\n", t3, gpio_get_level(EPD_BUSY), lo3);
-    bb_cmd(0x07); bb_d1(0xA5);   // deep sleep
+    // ---- power on + monitor BUSY continuously for 15s ----
+    epd_cmd(0x04);
+    int lo = 0;
+    for (int s = 0; s < 15; s++) {
+        int b = gpio_get_level(EPD_BUSY);
+        if (b == 0) lo = 1;
+        if (s < 3 || b == 0) printf("  t=%2ds BUSY=%d\n", s, b);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    printf("  power-on monitor done: saw_low=%d BUSY=%d\n", lo, gpio_get_level(EPD_BUSY));
 
-    printf("  EPD RESULT: %s\n", (lo1||lo2||lo3) ? "RESPONSIVE (BUSY asserted LOW)" : "NO RESPONSE (BUSY stayed HIGH)");
+    epd_cmd(0x12); vTaskDelay(pdMS_TO_TICKS(2000));  // refresh
+    printf("  after refresh: BUSY=%d\n", gpio_get_level(EPD_BUSY));
+    epd_cmd(0x02); vTaskDelay(pdMS_TO_TICKS(100));   // power off
+    epd_cmd(0x07); epd_d1(0xA5);                     // deep sleep
+
+    spi_bus_remove_device(epd_spi);
+    spi_bus_free(SPI2_HOST);
+    epd_spi = NULL;
+    printf("  EPD RESULT: %s\n", lo ? "RESPONSIVE (BUSY went LOW)" : "NO RESPONSE (BUSY stayed HIGH)");
 }
 
 /* ---------- SD card via SDSPI (C6 has no SDMMC host) ---------- */
